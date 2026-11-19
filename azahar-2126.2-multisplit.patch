@@ -1,0 +1,1336 @@
+diff --git a/src/citra_libretro/CMakeLists.txt b/src/citra_libretro/CMakeLists.txt
+index e28f994..2c97da5 100644
+--- a/src/citra_libretro/CMakeLists.txt
++++ b/src/citra_libretro/CMakeLists.txt
+@@ -94,8 +94,13 @@ if (CMAKE_SYSTEM_NAME STREQUAL "Darwin" OR
+     CMAKE_SYSTEM_NAME STREQUAL "iOS" OR
+     CMAKE_SYSTEM_NAME STREQUAL "tvOS")
+   target_link_libraries(citra_libretro PRIVATE "-Wl,-exported_symbols_list,${CMAKE_CURRENT_SOURCE_DIR}/libretro.osx.def")
+-else()
++elseif(NOT WIN32)
+   target_link_libraries(citra_libretro PRIVATE "-Wl,-Bsymbolic")
++  if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
++    set(MULTISPLIT_SYMBOLS "${CMAKE_CURRENT_SOURCE_DIR}/multisplit-linux.map")
++    target_link_options(citra_libretro PRIVATE "-Wl,--version-script,${MULTISPLIT_SYMBOLS}")
++    set_property(TARGET citra_libretro APPEND PROPERTY LINK_DEPENDS "${MULTISPLIT_SYMBOLS}")
++  endif()
+ endif()
+ 
+ add_custom_target(azahar_libretro DEPENDS citra_libretro)
+diff --git a/src/citra_libretro/citra_libretro.cpp b/src/citra_libretro/citra_libretro.cpp
+index 8a65f9d..9b03721 100644
+--- a/src/citra_libretro/citra_libretro.cpp
++++ b/src/citra_libretro/citra_libretro.cpp
+@@ -2,7 +2,9 @@
+ // Licensed under GPLv2 or any later version
+ // Refer to the license.txt file included.
+ 
++#include <chrono>
+ #include <list>
++#include <thread>
+ #include <numeric>
+ #include <vector>
+ #include <math.h>
+@@ -21,6 +23,7 @@
+ #include "video_core/gpu.h"
+ #ifdef ENABLE_OPENGL
+ #include "video_core/renderer_opengl/renderer_opengl.h"
++#include "video_core/renderer_opengl/gl_shader_manager.h"
+ #endif
+ #ifdef ENABLE_VULKAN
+ #include "citra_libretro/libretro_vk.h"
+@@ -46,8 +49,11 @@
+ #include "core/frontend/image_interface.h"
+ #include "core/hle/kernel/kernel.h"
+ #include "core/hle/kernel/memory.h"
++#include "core/hle/kernel/shared_page.h"
+ #include "core/hle/kernel/process.h"
+ #include "core/loader/loader.h"
++#include "network/network.h"
++#include "network/verify_user.h"
+ #include "core/memory.h"
+ 
+ #ifdef HAVE_LIBRETRO_VFS
+@@ -66,6 +72,68 @@ public:
+ };
+ 
+ CitraLibRetro* emu_instance;
++static bool multisplit_network_initialized{};
++
++extern "C" RETRO_API void azahar_multisplit_set_shader_context(
++    void* (*create)(), bool (*make_current)(void*),
++    void (*clear_current)(void*), void (*destroy)(void*)) {
++#ifdef ENABLE_OPENGL
++    OpenGL::SetMultisplitCompilerContext(create, make_current, clear_current, destroy);
++#endif
++}
++
++extern "C" RETRO_API bool azahar_multisplit_init_local() {
++    if (!multisplit_network_initialized)
++        multisplit_network_initialized = Network::Init();
++    return multisplit_network_initialized;
++}
++
++extern "C" RETRO_API void azahar_multisplit_set_equal_screens(bool enabled) {
++    EmuWindow_LibRetro::SetMultisplitEqualScreens(enabled);
++    if (emu_instance->emu_window)
++        emu_instance->emu_window->UpdateLayout();
++}
++
++extern "C" RETRO_API uint16_t azahar_multisplit_host_local(unsigned players) {
++    if (players < 2 || players > 4)
++        return 0;
++    auto room = Network::GetRoom().lock();
++    if (!room)
++        return 0;
++    if (room->GetState() == Network::Room::State::Open)
++        return room->GetRoomInformation().port;
++    if (!room->Create("Azahar Multisplit", "", "127.0.0.1", 0, "", players, "Player 1", "", 0,
++                      std::make_unique<Network::VerifyUser::NullBackend>(), {}))
++        return 0;
++    return room->GetRoomInformation().port;
++}
++
++extern "C" RETRO_API bool azahar_multisplit_join_local(uint16_t port, unsigned player) {
++    auto& system = Core::System::GetInstance();
++    auto member = Network::GetRoomMember().lock();
++    if (!system.IsPoweredOn() || !member || port == 0 || player >= 4)
++        return false;
++
++    const std::string suffix = std::to_string(player + 1);
++    member->Join("Player " + suffix, "multisplit-player-" + suffix, "127.0.0.1", port, 0,
++                 Network::NoPreferredMac, "", "");
++    using namespace std::chrono_literals;
++    const auto deadline = std::chrono::steady_clock::now() + 2s;
++    using State = Network::RoomMember::State;
++    while (member->GetState() == State::Joining &&
++           std::chrono::steady_clock::now() < deadline)
++        std::this_thread::sleep_for(5ms);
++    const auto state = member->GetState();
++    if (state != State::Joined && state != State::Moderator)
++        return false;
++    system.Kernel().GetSharedPageHandler().SetMacAddress(member->GetMacAddress());
++    return true;
++}
++
++static void LeaveMultisplitRoom() {
++    if (auto member = Network::GetRoomMember().lock(); member && member->IsConnected())
++        member->Leave();
++}
+ 
+ void retro_init() {
+     emu_instance = new CitraLibRetro();
+@@ -91,12 +159,17 @@ void retro_init() {
+ 
+ void retro_deinit() {
+     LOG_DEBUG(Frontend, "Shutting down core...");
++    LeaveMultisplitRoom();
+     if (Core::System::GetInstance().IsPoweredOn()) {
+         Core::System::GetInstance().Shutdown();
+     }
+ 
+     LibRetro::Input::Shutdown();
+ 
++    if (multisplit_network_initialized) {
++        Network::Shutdown();
++        multisplit_network_initialized = false;
++    }
+     delete emu_instance;
+ 
+     Common::Log::Stop();
+@@ -111,6 +184,7 @@ unsigned retro_api_version() {
+  */
+ static void UpdateSettings() {
+     LibRetro::ParseCoreOptions();
++    const bool pad_touch = LibRetro::settings.analog_function != LibRetro::CStickFunction::CStick;
+ 
+     struct retro_input_descriptor desc[] = {
+         {0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_LEFT, "Left"},
+@@ -124,11 +198,11 @@ static void UpdateSettings() {
+         {0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_L, "L"},
+         {0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_L2, "ZL"},
+         {0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_R, "R"},
+-        {0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_R2, "ZR"},
++        {0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_R2,
++         pad_touch ? "Touch Screen Touch" : "ZR"},
+         {0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_START, "Start"},
+         {0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_SELECT, "Select"},
+         {0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_L3, "Home/Swap screens"},
+-        {0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_R3, "Touch Screen Touch"},
+         {0, RETRO_DEVICE_ANALOG, RETRO_DEVICE_INDEX_ANALOG_LEFT, RETRO_DEVICE_ID_ANALOG_X,
+          "Circle Pad X"},
+         {0, RETRO_DEVICE_ANALOG, RETRO_DEVICE_INDEX_ANALOG_LEFT, RETRO_DEVICE_ID_ANALOG_Y,
+@@ -137,6 +211,7 @@ static void UpdateSettings() {
+          "C-Stick / Pointer X"},
+         {0, RETRO_DEVICE_ANALOG, RETRO_DEVICE_INDEX_ANALOG_RIGHT, RETRO_DEVICE_ID_ANALOG_Y,
+          "C-Stick / Pointer Y"},
++        {0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_R3, pad_touch ? "ZR" : nullptr},
+         {0, 0},
+     };
+ 
+@@ -185,9 +260,9 @@ static void UpdateSettings() {
+     // Citra: ZL = RETRO_DEVICE_ID_JOYPAD_L2 (12)
+     Settings::values.current_input_profile.buttons[Settings::NativeButton::Values::ZL] =
+         "button:12,joystick:0,engine:libretro";
+-    // Citra: ZR = RETRO_DEVICE_ID_JOYPAD_R2 (13)
++    // R2 (13) is the stylus in pointer modes, so R3 (15) takes over as ZR.
+     Settings::values.current_input_profile.buttons[Settings::NativeButton::Values::ZR] =
+-        "button:13,joystick:0,engine:libretro";
++        pad_touch ? "button:15,joystick:0,engine:libretro" : "button:13,joystick:0,engine:libretro";
+     // Citra: HOME = RETRO_DEVICE_ID_JOYPAD_L3 (as per above bindings) (14)
+     Settings::values.current_input_profile.buttons[Settings::NativeButton::Values::Home] =
+         "button:14,joystick:0,engine:libretro";
+@@ -369,8 +444,12 @@ static void setup_memory_maps() {
+ }
+ 
+ static bool do_load_game() {
++    auto& system = Core::System::GetInstance();
++    // NCSD titles must be registered as inserted cards so their auxiliary partitions are readable.
++    system.EjectCartridge();
++    system.InsertCartridge(LibRetro::settings.file_path);
+     const Core::System::ResultStatus load_result{
+-        Core::System::GetInstance().Load(*emu_instance->emu_window, LibRetro::settings.file_path)};
++        system.Load(*emu_instance->emu_window, LibRetro::settings.file_path)};
+ 
+     switch (load_result) {
+     case Core::System::ResultStatus::Success:
+@@ -404,6 +483,9 @@ static bool do_load_game() {
+         return false;
+     }
+ 
++    if (auto cfg = Service::CFG::GetModule(system))
++        cfg->SetSystemLanguage(LibRetro::settings.language_value);
++
+     u64 program_id{};
+     Core::System::GetInstance().GetAppLoader().ReadProgramId(program_id);
+     Core::System::GetInstance().GPU().ApplyPerProgramSettings(program_id);
+@@ -473,18 +555,15 @@ static void context_reset() {
+     if (!emu_instance->game_loaded) {
+         emu_instance->game_loaded = do_load_game();
+     } else {
+-        // Game is already loaded, just recreate the renderer for the new GL context
+-        if (Settings::values.graphics_api.GetValue() == Settings::GraphicsAPI::OpenGL) {
+-            Core::System::GetInstance().GPU().RecreateRenderer(*emu_instance->emu_window, nullptr);
+-        }
++        Core::System::GetInstance().GPU().RecreateRenderer(*emu_instance->emu_window, nullptr);
+     }
+ }
+ 
+ static void context_destroy() {
+     LOG_DEBUG(Frontend, "context_destroy");
+     if (emu_instance->game_loaded &&
+-        Settings::values.graphics_api.GetValue() == Settings::GraphicsAPI::OpenGL) {
+-        // Release the renderer's OpenGL resources
++        Settings::values.graphics_api.GetValue() != Settings::GraphicsAPI::Software) {
++        // Release device resources before the frontend destroys the context.
+         Core::System::GetInstance().GPU().ReleaseRenderer();
+     }
+     emu_instance->emu_window->DestroyContext();
+@@ -634,6 +713,7 @@ bool retro_load_game(const struct retro_game_info* info) {
+ 
+ void retro_unload_game() {
+     LOG_DEBUG(Frontend, "Unloading game...");
++    LeaveMultisplitRoom();
+     Core::System::GetInstance().Shutdown();
+ }
+ 
+diff --git a/src/citra_libretro/core_settings.cpp b/src/citra_libretro/core_settings.cpp
+index 53fb164..f6ff155 100644
+--- a/src/citra_libretro/core_settings.cpp
++++ b/src/citra_libretro/core_settings.cpp
+@@ -5,6 +5,7 @@
+ #include <boost/hana/string.hpp>
+ 
+ #include "citra_libretro/core_settings.h"
++#include "audio_core/sink_details.h"
+ #include "citra_libretro/environment.h"
+ 
+ #include "common/file_util.h"
+@@ -898,6 +899,10 @@ static Settings::AudioEmulation GetAudioEmulation(const std::string& name) {
+ }
+ 
+ static void ParseAudioOptions(void) {
++    // Multisplit still emulates the second DSP while discarding its host audio.
++    Settings::values.output_type =
++        LibRetro::FetchVariable("azahar_multisplit_audio_output", "enabled") == "disabled"
++            ? AudioCore::SinkType::Null : AudioCore::SinkType::LibRetro;
+     Settings::values.audio_emulation =
+         GetAudioEmulation(LibRetro::FetchVariable(config::audio::audio_emulation, "hle"));
+ 
+@@ -956,6 +961,10 @@ static void ParseGraphicsOptions(void) {
+     Settings::values.graphics_api =
+         GetGraphicsAPI(LibRetro::FetchVariable(config::graphics::graphics_api, "auto"));
+ 
++    Settings::values.async_shader_compilation =
++        LibRetro::FetchVariable("citra_async_shader_compilation", config::disabled) ==
++        config::enabled;
++
+     Settings::values.use_hw_shader = LibRetro::FetchVariable(config::graphics::use_hw_shader,
+                                                              config::enabled) == config::enabled;
+ 
+diff --git a/src/citra_libretro/emu_window/libretro_window.cpp b/src/citra_libretro/emu_window/libretro_window.cpp
+index f8cfb2c..0df42ae 100644
+--- a/src/citra_libretro/emu_window/libretro_window.cpp
++++ b/src/citra_libretro/emu_window/libretro_window.cpp
+@@ -234,6 +234,14 @@ void EmuWindow_LibRetro::DoneCurrent() {
+ 
+ void EmuWindow_LibRetro::OnMinimalClientAreaChangeRequest(std::pair<u32, u32> _minimal_size) {}
+ 
++namespace {
++bool multisplit_equal_screens{};
++}
++
++void EmuWindow_LibRetro::SetMultisplitEqualScreens(bool enabled) {
++    multisplit_equal_screens = enabled;
++}
++
+ LayoutGeometry ComputeLayoutGeometry() {
+     unsigned baseX;
+     unsigned baseY;
+@@ -242,6 +250,12 @@ LayoutGeometry ComputeLayoutGeometry() {
+     float scaling = Settings::values.resolution_factor.GetValue();
+     bool swapped = Settings::values.swap_screen.GetValue();
+ 
++    if (multisplit_equal_screens) {
++        return {static_cast<unsigned>(Core::kScreenBottomWidth * scaling),
++                static_cast<unsigned>((Core::kScreenTopHeight + Core::kScreenBottomHeight) * scaling),
++                true};
++    }
++
+     switch (Settings::values.layout_option.GetValue()) {
+     case Settings::LayoutOption::SingleScreen:
+         if (swapped) { // Bottom screen visible
+@@ -314,7 +328,15 @@ void EmuWindow_LibRetro::UpdateLayout() {
+     width = baseX;
+     height = baseY;
+ 
+-    UpdateCurrentFramebufferLayout(baseX, baseY);
++    if (multisplit_equal_screens) {
++        const Common::Rectangle<u32> upper{0, 0, baseX, baseY / 2};
++        const Common::Rectangle<u32> lower{0, baseY / 2, baseX, baseY};
++        const bool swapped = Settings::values.swap_screen.GetValue();
++        NotifyFramebufferLayoutChanged({baseX, baseY, true, true, swapped ? lower : upper,
++                                        swapped ? upper : lower});
++    } else {
++        UpdateCurrentFramebufferLayout(baseX, baseY);
++    }
+ 
+     doCleanFrame = true;
+ }
+diff --git a/src/citra_libretro/emu_window/libretro_window.h b/src/citra_libretro/emu_window/libretro_window.h
+index 1ff793f..1c8c3fd 100644
+--- a/src/citra_libretro/emu_window/libretro_window.h
++++ b/src/citra_libretro/emu_window/libretro_window.h
+@@ -41,6 +41,7 @@ public:
+ 
+     /// Prepares the window for rendering
+     void UpdateLayout();
++    static void SetMultisplitEqualScreens(bool enabled);
+ 
+     /// States whether a frame has been submitted. Resets after call.
+     bool HasSubmittedFrame();
+diff --git a/src/citra_libretro/input/mouse_tracker.cpp b/src/citra_libretro/input/mouse_tracker.cpp
+index a4ba964..4569370 100644
+--- a/src/citra_libretro/input/mouse_tracker.cpp
++++ b/src/citra_libretro/input/mouse_tracker.cpp
+@@ -114,130 +114,72 @@ MouseTracker::MouseTracker() {
+         break;
+     }
+ 
+-    last_moved = std::chrono::steady_clock::time_point::min();
+ }
+ 
+ MouseTracker::~MouseTracker() = default;
+ 
+-void MouseTracker::OnMouseMove(int deltaX, int deltaY) {
+-    x += deltaX;
+-    y += deltaY;
+-}
+-
+-void MouseTracker::Restrict(int minX, int minY, int maxX, int maxY) {
+-    x = std::clamp(x, minX, maxX);
+-    y = std::clamp(y, minY, maxY);
+-}
+-
+ void MouseTracker::Update(int bufferWidth, int bufferHeight,
+                           const Layout::FramebufferLayout& layout) {
+-    bool state = false;
+-    bool wasMoved = false;
+-
+-    if (LibRetro::settings.enable_mouse_touchscreen) {
+-        // Check mouse input
+-        state |= LibRetro::CheckInput(0, RETRO_DEVICE_MOUSE, 0, RETRO_DEVICE_ID_MOUSE_LEFT);
+-
+-        // Read in and convert pointer values to absolute values on the canvas
+-        auto pointerX = LibRetro::CheckInput(0, RETRO_DEVICE_POINTER, 0, RETRO_DEVICE_ID_POINTER_X);
+-        auto pointerY = LibRetro::CheckInput(0, RETRO_DEVICE_POINTER, 0, RETRO_DEVICE_ID_POINTER_Y);
+-        auto newX = static_cast<int>((pointerX + 0x7fff) / (float)(0x7fff * 2) * bufferWidth);
+-        auto newY = static_cast<int>((pointerY + 0x7fff) / (float)(0x7fff * 2) * bufferHeight);
+-
+-        // Use mouse pointer movement
+-        if ((pointerX != 0 || pointerY != 0) && (newX != lastMouseX || newY != lastMouseY)) {
+-            lastMouseX = newX;
+-            lastMouseY = newY;
+-
+-            // Use layout system to validate and map coordinates
+-            if (IsWithinTouchscreen(layout, newX, newY)) {
+-                x = std::clamp(newX, static_cast<int>(layout.bottom_screen.left),
+-                               static_cast<int>(layout.bottom_screen.right)) -
+-                    layout.bottom_screen.left;
+-                y = std::clamp(newY, static_cast<int>(layout.bottom_screen.top),
+-                               static_cast<int>(layout.bottom_screen.bottom)) -
+-                    layout.bottom_screen.top;
+-            }
+-        }
+-    }
+-
+-    if (LibRetro::settings.enable_touch_touchscreen) {
+-        // Check touchscreen input
+-        state |= LibRetro::CheckInput(0, RETRO_DEVICE_POINTER, 0, RETRO_DEVICE_ID_POINTER_PRESSED);
+-
+-        // Read in and convert pointer values to absolute values on the canvas
+-        auto pointerX = LibRetro::CheckInput(0, RETRO_DEVICE_POINTER, 0, RETRO_DEVICE_ID_POINTER_X);
+-        auto pointerY = LibRetro::CheckInput(0, RETRO_DEVICE_POINTER, 0, RETRO_DEVICE_ID_POINTER_Y);
+-        auto newX = static_cast<int>((pointerX + 0x7fff) / (float)(0x7fff * 2) * bufferWidth);
+-        auto newY = static_cast<int>((pointerY + 0x7fff) / (float)(0x7fff * 2) * bufferHeight);
+-
+-        // Use mouse pointer movement
+-        if ((pointerX != 0 || pointerY != 0) && (newX != lastMouseX || newY != lastMouseY)) {
+-            lastMouseX = newX;
+-            lastMouseY = newY;
++    framebuffer_layout = layout;
++    const auto& screen = layout.bottom_screen;
++    const auto width = static_cast<float>(screen.GetWidth());
++    const auto height = static_cast<float>(screen.GetHeight());
++    isPressed = false;
++    if (!layout.bottom_screen_enabled || width == 0 || height == 0)
++        return;
+ 
+-            // Use layout system to validate and map coordinates
++    bool pointerPressed = false;
++    if (LibRetro::settings.enable_mouse_touchscreen || LibRetro::settings.enable_touch_touchscreen) {
++        const auto pointerX = LibRetro::CheckInput(0, RETRO_DEVICE_POINTER, 0, RETRO_DEVICE_ID_POINTER_X);
++        const auto pointerY = LibRetro::CheckInput(0, RETRO_DEVICE_POINTER, 0, RETRO_DEVICE_ID_POINTER_Y);
++        // Libretro uses -32768 for coordinates outside the game viewport.
++        if (pointerX >= -32767 && pointerY >= -32767 && (pointerX != 0 || pointerY != 0)) {
++            const auto newX = static_cast<int>((pointerX + 32767) / 65534.0f * bufferWidth);
++            const auto newY = static_cast<int>((pointerY + 32767) / 65534.0f * bufferHeight);
+             if (IsWithinTouchscreen(layout, newX, newY)) {
+-                x = std::clamp(newX, static_cast<int>(layout.bottom_screen.left),
+-                               static_cast<int>(layout.bottom_screen.right)) -
+-                    layout.bottom_screen.left;
+-                y = std::clamp(newY, static_cast<int>(layout.bottom_screen.top),
+-                               static_cast<int>(layout.bottom_screen.bottom)) -
+-                    layout.bottom_screen.top;
++                pointerPressed =
++                    (LibRetro::settings.enable_mouse_touchscreen &&
++                     LibRetro::CheckInput(0, RETRO_DEVICE_MOUSE, 0, RETRO_DEVICE_ID_MOUSE_LEFT)) ||
++                    (LibRetro::settings.enable_touch_touchscreen &&
++                     LibRetro::CheckInput(0, RETRO_DEVICE_POINTER, 0, RETRO_DEVICE_ID_POINTER_PRESSED));
++                if (pointerPressed || pointerX != lastMouseX || pointerY != lastMouseY) {
++                    x = (newX - static_cast<float>(screen.left)) / width;
++                    y = (newY - static_cast<float>(screen.top)) / height;
++                }
+             }
+         }
++        lastMouseX = pointerX;
++        lastMouseY = pointerY;
+     }
+ 
++    bool padPressed = false;
+     if (LibRetro::settings.analog_function != LibRetro::CStickFunction::CStick) {
+-        // Check right analog input
+-        state |= LibRetro::CheckInput(0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_R3);
+-
+-        // TODO: Provide config option for ratios here
+-        auto widthSpeed = (layout.bottom_screen.GetWidth() / 20.0);
+-        auto heightSpeed = (layout.bottom_screen.GetHeight() / 20.0);
+-
+-        // Use controller movement
+-        float controllerX =
+-            ((float)LibRetro::CheckInput(0, RETRO_DEVICE_ANALOG, RETRO_DEVICE_INDEX_ANALOG_RIGHT,
+-                                         RETRO_DEVICE_ID_ANALOG_X) /
+-             INT16_MAX);
+-        float controllerY =
+-            ((float)LibRetro::CheckInput(0, RETRO_DEVICE_ANALOG, RETRO_DEVICE_INDEX_ANALOG_RIGHT,
+-                                         RETRO_DEVICE_ID_ANALOG_Y) /
+-             INT16_MAX);
+-
+-        // Deadzone the controller inputs
+-        float magnitudeX = std::abs(controllerX);
+-        float magnitudeY = std::abs(controllerY);
+-
+-        if (magnitudeX < LibRetro::settings.analog_deadzone) {
+-            controllerX = 0;
+-        }
+-        if (magnitudeY < LibRetro::settings.analog_deadzone) {
+-            controllerY = 0;
++        padPressed = LibRetro::CheckInput(0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_R2);
++        if (!pointerPressed) {
++            const auto readAxis = [](unsigned axis) {
++                const float value = std::clamp(
++                    LibRetro::CheckInput(0, RETRO_DEVICE_ANALOG, RETRO_DEVICE_INDEX_ANALOG_RIGHT, axis) /
++                        32767.0f, -1.0f, 1.0f);
++                const float deadzone = LibRetro::settings.analog_deadzone;
++                if (std::abs(value) <= deadzone)
++                    return 0.0f;
++                return std::copysign((std::abs(value) - deadzone) / (1.0f - deadzone), value);
++            };
++            const float dx = readAxis(RETRO_DEVICE_ID_ANALOG_X);
++            const float dy = readAxis(RETRO_DEVICE_ID_ANALOG_Y);
++            // Five native 3DS touchscreen pixels per frame at full stick deflection.
++            x += dx / 64.0f;
++            y += dy / 48.0f;
++            if (padPressed || dx != 0.0f || dy != 0.0f)
++                last_moved = std::chrono::steady_clock::now();
+         }
+-
+-        if (controllerX != 0 || controllerY != 0) {
+-            wasMoved = true;
+-        }
+-
+-        OnMouseMove(static_cast<int>(controllerX * widthSpeed),
+-                    static_cast<int>(controllerY * heightSpeed));
+     }
+ 
+-    Restrict(0, 0, layout.bottom_screen.GetWidth(), layout.bottom_screen.GetHeight());
+-
+-    // Store as bottom-screen-local pixel coordinates
+-    projectedX = static_cast<float>(x);
+-    projectedY = static_cast<float>(y);
+-
+-    isPressed = state;
+-
+-    if (wasMoved) {
+-        last_moved = std::chrono::steady_clock::now();
+-    }
+-
+-    this->framebuffer_layout = layout;
++    x = std::clamp(x, 0.0f, 1.0f);
++    y = std::clamp(y, 0.0f, 1.0f);
++    projectedX = std::min(x * width, width - 1.0f);
++    projectedY = std::min(y * height, height - 1.0f);
++    isPressed = pointerPressed || padPressed;
+ }
+ 
+ void MouseTracker::Render(int bufferWidth, int bufferHeight, void* framebuffer_data) {
+@@ -258,14 +200,11 @@ void MouseTracker::Render(int bufferWidth, int bufferHeight, void* framebuffer_d
+ }
+ 
+ Frontend::EmuWindow::CursorInfo MouseTracker::GetCursorInfo() {
+-    bool visible = true;
+-    auto current = std::chrono::steady_clock::now();
+-    uint64_t since_last_moved =
+-        std::chrono::duration_cast<std::chrono::seconds>(current - last_moved).count();
+-    constexpr auto timeout_secs = 4; // TODO: Make this configurable maybe? -OS
+-    if (LibRetro::settings.enable_touch_pointer_timeout && since_last_moved >= timeout_secs) {
+-        visible = false;
+-    }
++    const auto now = std::chrono::steady_clock::now();
++    const bool recently_moved = last_moved != std::chrono::steady_clock::time_point{} &&
++                                now - last_moved < std::chrono::seconds(4);
++    const bool visible = framebuffer_layout.bottom_screen_enabled &&
++                         (isPressed || !LibRetro::settings.enable_touch_pointer_timeout || recently_moved);
+     return {visible, projectedX, projectedY};
+ }
+ 
+diff --git a/src/citra_libretro/input/mouse_tracker.h b/src/citra_libretro/input/mouse_tracker.h
+index 548b9ad..3b18bc2 100644
+--- a/src/citra_libretro/input/mouse_tracker.h
++++ b/src/citra_libretro/input/mouse_tracker.h
+@@ -5,6 +5,7 @@
+ #pragma once
+ 
+ #include <chrono>
++#include <cstdint>
+ #include "common/math_util.h"
+ #include "core/frontend/emu_window.h"
+ #include "core/frontend/framebuffer_layout.h"
+@@ -32,12 +33,6 @@ public:
+     MouseTracker();
+     ~MouseTracker();
+ 
+-    /// Called whenever a mouse moves.
+-    void OnMouseMove(int xDelta, int yDelta);
+-
+-    /// Restricts the mouse cursor to a specified rectangle.
+-    void Restrict(int minX, int minY, int maxX, int maxY);
+-
+     /// Updates the tracker.
+     void Update(int bufferWidth, int bufferHeight, const Layout::FramebufferLayout& layout);
+ 
+@@ -59,19 +54,16 @@ public:
+     Frontend::EmuWindow::CursorInfo GetCursorInfo();
+ 
+ private:
+-    int x;
+-    int y;
+-
+-    float lastMouseX;
+-    float lastMouseY;
+-
+-    float projectedX;
+-    float projectedY;
+-
+-    std::chrono::steady_clock::time_point last_moved;
+-    bool isPressed;
+-
+-    Layout::FramebufferLayout framebuffer_layout;
++    // Keep the stylus position in touchscreen coordinates across layout changes.
++    float x{0.5f};
++    float y{0.5f};
++    int16_t lastMouseX{-32768};
++    int16_t lastMouseY{-32768};
++    float projectedX{};
++    float projectedY{};
++    std::chrono::steady_clock::time_point last_moved{};
++    bool isPressed{};
++    Layout::FramebufferLayout framebuffer_layout{};
+     std::unique_ptr<CursorRenderer> cursor_renderer;
+ };
+ 
+diff --git a/src/citra_libretro/libretro_vk.cpp b/src/citra_libretro/libretro_vk.cpp
+index 8a1ac0a..750f344 100644
+--- a/src/citra_libretro/libretro_vk.cpp
++++ b/src/citra_libretro/libretro_vk.cpp
+@@ -697,6 +697,10 @@ void PresentWindow::Present(Frame* frame) {
+         return;
+     }
+ 
++    // Finish queued host submissions before exposing the output image to the compositor.
++    // This waits for the scheduler thread, while GPU rendering remains asynchronous.
++    scheduler.WaitWorker();
++
+     // CRITICAL: Use persistent struct to avoid stack lifetime issues!
+     // RetroArch may cache this pointer for frame duping during pause
+     persistent_libretro_image.image_view = static_cast<VkImageView>(frame->image_view);
+@@ -759,12 +763,19 @@ MasterSemaphoreLibRetro::MasterSemaphoreLibRetro(const Instance& instance_) : in
+ }
+ 
+ MasterSemaphoreLibRetro::~MasterSemaphoreLibRetro() {
+-    // wait_thread will be automatically stopped by jthread destructor
+-    // Clean up remaining fences
++    wait_thread.request_stop();
++    wait_thread.join();
++
+     const vk::Device device{instance.GetDevice()};
+     for (const auto& fence : free_queue) {
+         device.destroyFence(fence);
+     }
++    while (!wait_queue.empty()) {
++        const auto [fence, tick] = wait_queue.front();
++        [[maybe_unused]] const auto result = device.waitForFences(fence, true, UINT64_MAX);
++        device.destroyFence(fence);
++        wait_queue.pop();
++    }
+ }
+ 
+ void MasterSemaphoreLibRetro::Refresh() {}
+diff --git a/src/citra_libretro/multisplit-linux.map b/src/citra_libretro/multisplit-linux.map
+new file mode 100644
+index 0000000..b150133
+--- /dev/null
++++ b/src/citra_libretro/multisplit-linux.map
+@@ -0,0 +1,7 @@
++{
++    global:
++        retro_*;
++        azahar_multisplit_*;
++    local:
++        *;
++};
+diff --git a/src/common/file_util.cpp b/src/common/file_util.cpp
+index 3168a26..097d396 100644
+--- a/src/common/file_util.cpp
++++ b/src/common/file_util.cpp
+@@ -549,7 +549,11 @@ u64 GetSize(const std::string& filename) {
+ 
+ u64 GetSize(const int fd) {
+     file_stat_t buf;
++#ifdef _WIN32
++    if (_fstat64(fd, &buf) != 0) {
++#else
+     if (fstat(fd, &buf) != 0) {
++#endif
+         LOG_ERROR(Common_Filesystem, "GetSize: stat failed {}: {}", fd, GetLastErrorMsg());
+         return 0;
+     }
+diff --git a/src/core/hle/service/dlp/dlp_base.cpp b/src/core/hle/service/dlp/dlp_base.cpp
+index dab9f9d..9d01fbf 100644
+--- a/src/core/hle/service/dlp/dlp_base.cpp
++++ b/src/core/hle/service/dlp/dlp_base.cpp
+@@ -8,7 +8,6 @@
+ #include <cryptopp/modes.h>
+ #include "common/alignment.h"
+ #include "common/swap.h"
+-#include "common/timer.h"
+ #include "core/hle/ipc_helpers.h"
+ #include "core/hle/service/nwm/uds_data.h"
+ #include "core/hle/service/service.h"
+@@ -93,52 +92,6 @@ void DLP_Base::FinalizeDlpBase() {
+     username = DLP_Username{};
+ }
+ 
+-bool DLP_Base::ConnectToNetworkAsync(NWM::NetworkInfo net_info, NWM::ConnectionType conn_type,
+-                                     std::vector<u8> passphrase) {
+-    auto uds = GetUDS();
+-
+-    // we need to make this event manually
+-    uds->connection_event =
+-        system.Kernel().CreateEvent(Kernel::ResetType::OneShot, "dlp_connect_to_beacon");
+-
+-    uds->ConnectToNetworkHLE(net_info, static_cast<u8>(conn_type), passphrase);
+-
+-    // wait for connection
+-    Common::Timer t_time_out;
+-    t_time_out.Start();
+-    bool timed_out = false;
+-    while (true) { // busy wait, TODO: change to not busy wait?
+-        if (uds->GetConnectionStatusHLE().status == NWM::NetworkStatus::ConnectedAsSpectator ||
+-            uds->GetConnectionStatusHLE().status == NWM::NetworkStatus::ConnectedAsClient) {
+-            // connected
+-            break;
+-        }
+-        constexpr u32 connect_network_timeout_ms = 3000;
+-        if (t_time_out.GetTimeElapsed().count() > connect_network_timeout_ms) {
+-            timed_out = true;
+-            break;
+-        }
+-    }
+-
+-    if (timed_out) {
+-        // TODO: fix unlikely race cond, timeout happens, we disconnect, then server registers our
+-        // connection
+-        uds->DisconnectNetworkHLE();
+-        LOG_ERROR(Service_DLP, "Timed out when trying to connect to beacon");
+-        return false;
+-    }
+-
+-    if (uds->GetConnectionStatusHLE().status != NWM::NetworkStatus::ConnectedAsSpectator &&
+-        uds->GetConnectionStatusHLE().status != NWM::NetworkStatus::ConnectedAsClient) {
+-        // error!
+-        LOG_ERROR(Service_DLP, "Could not connect to network, connected as 0x{:x}",
+-                  static_cast<u32>(uds->GetConnectionStatusHLE().status));
+-        return false;
+-    }
+-
+-    return true;
+-}
+-
+ int DLP_Base::RecvFrom(u16 node_id, std::vector<u8>& buffer, u16* out_node) {
+     constexpr u32 max_pullpacket_size = 0x3c00;
+     std::vector<u8> buffer_out;
+diff --git a/src/core/hle/service/dlp/dlp_base.h b/src/core/hle/service/dlp/dlp_base.h
+index c0d08fb..4bb436e 100644
+--- a/src/core/hle/service/dlp/dlp_base.h
++++ b/src/core/hle/service/dlp/dlp_base.h
+@@ -326,7 +326,7 @@ protected:
+ 
+     const u32 uds_sharedmem_size = 0x4000;
+     const u32 uds_version = 0x400;
+-    const u8 num_broadcast_packets = 5;
++    static constexpr std::size_t num_broadcast_packets = 5;
+     u32 dlp_sharedmem_size{};
+ 
+     constexpr static inline u32 dlp_poll_rate_normal = 100;
+@@ -357,8 +357,6 @@ protected:
+                            std::shared_ptr<Kernel::Event> event, DLP_Username username);
+     void FinalizeDlpBase();
+ 
+-    bool ConnectToNetworkAsync(NWM::NetworkInfo net_info, NWM::ConnectionType conn_type,
+-                               std::vector<u8> passphrase);
+     // out_node: if node_id is broadcast, check which node we received from
+     int RecvFrom(u16 node_id, std::vector<u8>& buffer, u16* out_node = nullptr);
+     bool SendTo(u16 node_id, u8 data_channel, std::vector<u8>& buffer, u8 flags = 0);
+diff --git a/src/core/hle/service/dlp/dlp_clt_base.cpp b/src/core/hle/service/dlp/dlp_clt_base.cpp
+index 73bc2d5..4f7bf70 100644
+--- a/src/core/hle/service/dlp/dlp_clt_base.cpp
++++ b/src/core/hle/service/dlp/dlp_clt_base.cpp
+@@ -4,9 +4,10 @@
+ 
+ #include "dlp_clt_base.h"
+ 
++#include <algorithm>
++
+ #include "common/alignment.h"
+ #include "common/string_util.h"
+-#include "common/timer.h"
+ #include "core/hle/ipc_helpers.h"
+ #include "core/hle/service/am/am.h"
+ #include "core/hle/service/nwm/uds_beacon.h"
+@@ -46,7 +47,13 @@ void DLP_Clt_Base::InitializeCltBase(u32 shared_mem_size, u32 max_beacons, u32 c
+ }
+ 
+ void DLP_Clt_Base::FinalizeCltBase() {
+-    clt_state = DLP_Clt_State::Initialized;
++    {
++        std::scoped_lock lock{beacon_mutex, clt_state_mutex};
++        clt_state = DLP_Clt_State::Initialized;
++        is_scanning = false;
++        system.CoreTiming().UnscheduleEvent(beacon_scan_event, 0);
++        EndBeaconProbe();
++    }
+ 
+     if (is_connected) {
+         DisconnectFromServer();
+@@ -162,6 +169,7 @@ void DLP_Clt_Base::StopScan(Kernel::HLERequestContext& ctx) {
+         LOG_INFO(Service_DLP, "Ending scan worker");
+ 
+         system.CoreTiming().UnscheduleEvent(beacon_scan_event, 0);
++        EndBeaconProbe();
+     }
+ 
+     IPC::RequestBuilder rb = rp.MakeBuilder(1, 0);
+@@ -452,125 +460,124 @@ void DLP_Clt_Base::BeaconScanCallback(std::uintptr_t user_data, s64 cycles_late)
+         return;
+     }
+ 
+-    auto uds = GetUDS();
+-    Common::Timer beacon_parse_timer_total;
+-
+-    // sadly, we have to impl the scan code ourselves
+-    // because the nwm recvbeaconbroadcastdata function
+-    // has a timeout in it, which won't work here because
+-    // we don't have a uds server/client session
+-    auto beacons = uds->GetReceivedBeacons(Network::BroadcastMac);
+-
+-    beacon_parse_timer_total.Start();
+-
+-    for (auto& beacon : beacons) {
+-        if (auto idx = GetCachedTitleInfoIdx(beacon.transmitter_address); idx != -1) {
+-            // update server info from beacon
+-            auto b = GetDLPServerInfoFromRawBeacon(beacon);
+-            scanned_title_info[idx].second.clients_joined =
+-                b.clients_joined; // we only want to update clients joined
+-            continue;
+-        }
+-        if (scanned_title_info.size() >= max_title_info) {
+-            break;
+-        }
+-        if (ignore_servers_list[beacon.transmitter_address]) {
+-            continue;
++    if (beacon_probe) {
++        PollBeaconProbe();
++    } else {
++        auto beacons = GetUDS()->GetReceivedBeacons(Network::BroadcastMac);
++        for (auto& beacon : beacons) {
++            if (auto idx = GetCachedTitleInfoIdx(beacon.transmitter_address); idx != -1) {
++                scanned_title_info[idx].second.clients_joined =
++                    GetDLPServerInfoFromRawBeacon(beacon).clients_joined;
++                continue;
++            }
++            if (scanned_title_info.size() >= max_title_info) {
++                break;
++            }
++            if (!ignore_servers_list[beacon.transmitter_address]) {
++                StartBeaconProbe(std::move(beacon));
++                break;
++            }
+         }
+-
+-        CacheBeaconTitleInfo(beacon);
+     }
+ 
+-    // set our next scan interval
++    // Both Libretro instances run on the frontend thread. Yield between polling attempts
++    // so a second emulated console can advance its own scheduled broadcasts.
++    constexpr int probe_poll_interval_ms = 10;
++    const auto interval_ms = beacon_probe ? probe_poll_interval_ms : beacon_scan_interval_ms;
+     system.CoreTiming().ScheduleEvent(
+-        msToCycles(std::max<int>(100, beacon_scan_interval_ms -
+-                                          beacon_parse_timer_total.GetTimeElapsed().count())) -
+-            cycles_late,
+-        beacon_scan_event, 0);
++        std::max<s64>(1, msToCycles(interval_ms) - cycles_late), beacon_scan_event, 0);
+ }
+ 
+-void DLP_Clt_Base::CacheBeaconTitleInfo(Network::WifiPacket& beacon) {
+-    // connect to the network as a spectator
+-    // and receive dlp data
+-
+-    auto uds = GetUDS();
+-
+-    NWM::NetworkInfo net_info;
++void DLP_Clt_Base::StartBeaconProbe(Network::WifiPacket beacon) {
++    NWM::NetworkInfo net_info{};
+     net_info.host_mac_address = beacon.transmitter_address;
+-    net_info.channel = dlp_net_info_channel;
++    net_info.channel = beacon.channel;
+     net_info.initialized = true;
+     net_info.oui_value = NWM::NintendoOUI;
+ 
+-    if (!ConnectToNetworkAsync(net_info, NWM::ConnectionType::Spectator, dlp_password_buf)) {
+-        LOG_ERROR(Service_DLP, "Could not connect to network.");
+-        return;
+-    }
+-
+-    LOG_INFO(Service_DLP, "Connected to spec to network");
+-
+-    auto [ret, data_available_event] =
+-        uds->BindHLE(dlp_bind_node_id, dlp_recv_buffer_size, dlp_broadcast_data_channel,
+-                     dlp_host_network_node_id);
+-    if (ret != NWM::ResultStatus::ResultSuccess) {
+-        LOG_ERROR(Service_DLP, "Could not bind on node id 0x{:x}", dlp_bind_node_id);
+-        return;
+-    }
+-
+-    auto aes = GenDLPChecksumKey(beacon.transmitter_address);
+-
+-    constexpr u32 max_beacon_recv_time_out_ms = 1000;
+-
+-    Common::Timer beacon_parse_timer;
+-    beacon_parse_timer.Start();
++    constexpr int connect_timeout_ms = 3000;
++    auto& probe = beacon_probe.emplace();
++    probe.checksum_key = GenDLPChecksumKey(beacon.transmitter_address);
++    probe.beacon = std::move(beacon);
++    probe.deadline_ticks = system.CoreTiming().GetTicks() + msToCycles(connect_timeout_ms);
++    auto uds = GetUDS();
++    uds->connection_event =
++        system.Kernel().CreateEvent(Kernel::ResetType::OneShot, "dlp_connect_to_beacon");
++    uds->ConnectToNetworkHLE(net_info, static_cast<u8>(NWM::ConnectionType::Spectator),
++                             dlp_password_buf);
++}
+ 
+-    std::unordered_map<int, bool> got_broadcast_packet;
+-    std::unordered_map<int, std::vector<u8>> broadcast_packet_idx_buf;
+-    DLP_Username server_username; // workaround before I decrypt the beacon data
+-    std::vector<u8> recv_buf;
+-    bool got_all_packets = false;
+-    while (beacon_parse_timer.GetTimeElapsed().count() < max_beacon_recv_time_out_ms) {
+-        if (int sz = RecvFrom(dlp_host_network_node_id, recv_buf)) {
+-            auto p_head = reinterpret_cast<DLPPacketHeader*>(recv_buf.data());
+-            if (!ValidatePacket(aes, p_head, sz, should_verify_checksum) ||
+-                p_head->packet_index >= num_broadcast_packets) {
+-                ignore_servers_list[beacon.transmitter_address] = true;
+-                break; // corrupted info
++void DLP_Clt_Base::PollBeaconProbe() {
++    auto& probe = *beacon_probe;
++    auto uds = GetUDS();
++    const s64 ticks = system.CoreTiming().GetTicks();
++    if (!probe.bound &&
++        uds->GetConnectionStatusHLE().status == NWM::NetworkStatus::ConnectedAsSpectator) {
++        const auto [result, event] = uds->BindHLE(dlp_bind_node_id, dlp_recv_buffer_size,
++                                                 dlp_broadcast_data_channel,
++                                                 dlp_host_network_node_id);
++        if (result != NWM::ResultStatus::ResultSuccess) {
++            LOG_ERROR(Service_DLP, "Could not bind the spectator to the DLP broadcast channel");
++            EndBeaconProbe();
++            return;
++        }
++        constexpr int receive_timeout_ms = 1500;
++        probe.bound = true;
++        probe.deadline_ticks = ticks + msToCycles(receive_timeout_ms);
++    }
++
++    if (probe.bound) {
++        constexpr std::array packet_sizes{sizeof(DLPBroadcastPacket1), sizeof(DLPBroadcastPacket2),
++                                          sizeof(DLPBroadcastPacket3), sizeof(DLPBroadcastPacket4),
++                                          sizeof(DLPBroadcastPacket5)};
++        std::vector<u8> buffer;
++        while (const auto size = RecvFrom(dlp_bind_node_id, buffer)) {
++            if (!ValidatePacket(probe.checksum_key, buffer.data(), size, should_verify_checksum)) {
++                continue;
+             }
+-            got_broadcast_packet[p_head->packet_index] = true;
+-            broadcast_packet_idx_buf[p_head->packet_index] = recv_buf;
+-            if (got_broadcast_packet.size() == num_broadcast_packets) {
+-                got_all_packets = true;
+-                constexpr u16 nwm_host_node_network_id = 0x1;
+-                server_username = uds->GetNodeInformationHLE(nwm_host_node_network_id)->username;
+-                break; // we got all 5!
++            const auto index = GetPacketHead(buffer)->packet_index;
++            if (index < packet_sizes.size() && buffer.size() >= packet_sizes[index]) {
++                probe.packets[index] = std::move(buffer);
+             }
+         }
++        if (std::all_of(probe.packets.begin(), probe.packets.end(),
++                        [](const auto& packet) { return !packet.empty(); })) {
++            const auto node = uds->GetNodeInformationHLE(dlp_host_network_node_id);
++            CacheBeaconTitleInfo(probe, node ? node->username : DLP_Username{});
++            EndBeaconProbe();
++            return;
++        }
+     }
+ 
+-    uds->UnbindHLE(dlp_bind_node_id);
+-    uds->DisconnectNetworkHLE();
++    if (ticks >= probe.deadline_ticks) {
++        LOG_DEBUG(Service_DLP, "DLP title probe timed out; the next scan can retry");
++        EndBeaconProbe();
++    }
++}
+ 
+-    if (!got_all_packets) {
+-        if (!got_broadcast_packet.size()) {
+-            // we didn't get ANY packet info from this server
+-            // so we add it to the ignore list
+-            ignore_servers_list[beacon.transmitter_address] = true;
+-        }
+-        LOG_ERROR(Service_DLP, "Connected to beacon, but could not receive all dlp packets");
++void DLP_Clt_Base::EndBeaconProbe() {
++    if (!beacon_probe) {
+         return;
+     }
++    auto uds = GetUDS();
++    if (beacon_probe->bound) {
++        uds->UnbindHLE(dlp_bind_node_id);
++    }
++    uds->DisconnectNetworkHLE();
++    beacon_probe.reset();
++}
+ 
+-    // parse packets into cached DLPServerInfo and DLPTitleInfo
+-    auto broad_pk1 = reinterpret_cast<DLPBroadcastPacket1*>(broadcast_packet_idx_buf[0].data());
+-    auto broad_pk2 = reinterpret_cast<DLPBroadcastPacket2*>(broadcast_packet_idx_buf[1].data());
+-    auto broad_pk3 = reinterpret_cast<DLPBroadcastPacket3*>(broadcast_packet_idx_buf[2].data());
+-    auto broad_pk4 = reinterpret_cast<DLPBroadcastPacket4*>(broadcast_packet_idx_buf[3].data());
+-    [[maybe_unused]] auto broad_pk5 =
+-        reinterpret_cast<DLPBroadcastPacket5*>(broadcast_packet_idx_buf[4].data());
++void DLP_Clt_Base::CacheBeaconTitleInfo(BeaconProbe& probe, DLP_Username server_username) {
++    auto& beacon = probe.beacon;
++    const auto broad_pk1 = reinterpret_cast<DLPBroadcastPacket1*>(probe.packets[0].data());
++    const auto broad_pk2 = reinterpret_cast<DLPBroadcastPacket2*>(probe.packets[1].data());
++    const auto broad_pk3 = reinterpret_cast<DLPBroadcastPacket3*>(probe.packets[2].data());
++    const auto broad_pk4 = reinterpret_cast<DLPBroadcastPacket4*>(probe.packets[3].data());
+ 
+     // apply title filter
+     if (scan_title_id_filter && broad_pk1->child_title_id != scan_title_id_filter) {
+-        LOG_WARNING(Service_DLP, "Got title info, but it did not match title id filter");
++        LOG_DEBUG(Service_DLP, "Got title info, but it did not match title id filter");
++        ignore_servers_list[beacon.transmitter_address] = true;
+         return;
+     }
+ 
+diff --git a/src/core/hle/service/dlp/dlp_clt_base.h b/src/core/hle/service/dlp/dlp_clt_base.h
+index 53cd566..da086f5 100644
+--- a/src/core/hle/service/dlp/dlp_clt_base.h
++++ b/src/core/hle/service/dlp/dlp_clt_base.h
+@@ -4,6 +4,7 @@
+ 
+ #pragma once
+ 
++#include <optional>
+ #include "core/hle/kernel/event.h"
+ #include "core/hle/kernel/shared_memory.h"
+ #include "dlp_base.h"
+@@ -79,6 +80,14 @@ protected:
+ 
+     Core::TimingEventType* beacon_scan_event;
+ 
++    struct BeaconProbe {
++        Network::WifiPacket beacon;
++        s64 deadline_ticks{};
++        u32 checksum_key{};
++        bool bound{};
++        std::array<std::vector<u8>, num_broadcast_packets> packets;
++    };
++    std::optional<BeaconProbe> beacon_probe;
+     std::mutex beacon_mutex;
+     std::recursive_mutex title_info_mutex;
+     std::recursive_mutex clt_state_mutex;
+@@ -102,7 +111,10 @@ protected:
+     void GenerateChannelHandle();
+     u32 GetCltState();
+     void BeaconScanCallback(std::uintptr_t user_data, s64 cycles_late);
+-    void CacheBeaconTitleInfo(Network::WifiPacket& beacon);
++    void StartBeaconProbe(Network::WifiPacket beacon);
++    void PollBeaconProbe();
++    void EndBeaconProbe();
++    void CacheBeaconTitleInfo(BeaconProbe& probe, DLP_Username server_username);
+     int GetCachedTitleInfoIdx(Network::MacAddress mac_addr);
+     bool TitleInfoIsCached(Network::MacAddress mac_addr);
+     DLPServerInfo GetDLPServerInfoFromRawBeacon(Network::WifiPacket& beacon);
+diff --git a/src/core/hle/service/dlp/dlp_srvr.cpp b/src/core/hle/service/dlp/dlp_srvr.cpp
+index 15ef48b..ab22383 100644
+--- a/src/core/hle/service/dlp/dlp_srvr.cpp
++++ b/src/core/hle/service/dlp/dlp_srvr.cpp
+@@ -73,6 +73,10 @@ bool DLP_SRVR::CacheContentFileInMemory(u32 process_id) {
+     }
+ 
+     auto title_info = fs->GetProgramLaunchInfo(process_id);
++    if (!title_info) {
++        LOG_ERROR(Service_DLP, "Could not get DLP title information for process {}", process_id);
++        return false;
++    }
+ 
+     // get special content index. could have made a new
+     // HLE func in FS, but this is so small that it
+@@ -105,7 +109,8 @@ bool DLP_SRVR::CacheContentFileInMemory(u32 process_id) {
+     auto file_result = container.OpenFile(file_path, open_mode, open_attributes_none);
+ 
+     if (file_result.Failed()) {
+-        LOG_ERROR(Service_DLP, "Could not open DLP child archive");
++        LOG_ERROR(Service_DLP, "Could not open DLP child archive (title {:016x}, partition {}, result {:08x})",
++                  title_info->program_id, *index, file_result.Code().raw);
+         return false;
+     }
+ 
+diff --git a/src/network/room.cpp b/src/network/room.cpp
+index c7e34ee..cb94998 100644
+--- a/src/network/room.cpp
++++ b/src/network/room.cpp
+@@ -1031,6 +1031,15 @@ bool Room::Create(const std::string& name, const std::string& description,
+     if (!room_impl->server) {
+         return false;
+     }
++    if (server_port == 0) {
++        ENetAddress bound{};
++        if (enet_socket_get_address(room_impl->server->socket, &bound) != 0) {
++            enet_host_destroy(room_impl->server);
++            room_impl->server = nullptr;
++            return false;
++        }
++        server_port = bound.port;
++    }
+     room_impl->state = State::Open;
+ 
+     room_impl->room_information.name = name;
+diff --git a/src/video_core/renderer_opengl/gl_rasterizer.cpp b/src/video_core/renderer_opengl/gl_rasterizer.cpp
+index 7c820e9..b5a901e 100644
+--- a/src/video_core/renderer_opengl/gl_rasterizer.cpp
++++ b/src/video_core/renderer_opengl/gl_rasterizer.cpp
+@@ -622,7 +622,10 @@ bool RasterizerOpenGL::Draw(bool accelerate, bool is_indexed) {
+     state.Apply();
+ 
+     // Sync and bind the shader
+-    curr_shader_manager->UseFragmentShader(regs, user_config);
++    if (!curr_shader_manager->UseFragmentShader(regs, user_config)) {
++        vertex_batch.clear();
++        return true;
++    }
+ 
+     // Sync the LUTs within the texture buffer
+     SyncAndUploadLUTs();
+diff --git a/src/video_core/renderer_opengl/gl_shader_manager.cpp b/src/video_core/renderer_opengl/gl_shader_manager.cpp
+index ba05e32..bf2d735 100644
+--- a/src/video_core/renderer_opengl/gl_shader_manager.cpp
++++ b/src/video_core/renderer_opengl/gl_shader_manager.cpp
+@@ -3,6 +3,10 @@
+ // Refer to the license.txt file included.
+ 
+ #include <algorithm>
++#include <chrono>
++#include <condition_variable>
++#include <deque>
++#include <future>
+ #include <mutex>
+ #include <set>
+ #include <span>
+@@ -137,6 +141,96 @@ private:
+     std::variant<OGLShader, OGLProgram> shader_or_program;
+ };
+ 
++struct FragmentCompilerContext {
++    void* (*create)(){};
++    bool (*make_current)(void*){};
++    void (*clear_current)(void*){};
++    void (*destroy)(void*){};
++};
++static FragmentCompilerContext fragment_compiler_context;
++
++void SetMultisplitCompilerContext(void* (*create)(), bool (*make_current)(void*),
++                                  void (*clear_current)(void*), void (*destroy)(void*)) {
++    fragment_compiler_context = {create, make_current, clear_current, destroy};
++}
++
++class FragmentCompiler {
++public:
++    explicit FragmentCompiler(FragmentCompilerContext callbacks_) : callbacks(callbacks_) {}
++
++    bool Start() {
++        context = callbacks.create();
++        if (!context)
++            return false;
++        std::promise<bool> started;
++        auto ready = started.get_future();
++        thread = std::thread([this, result = std::move(started)]() mutable {
++            const bool current = callbacks.make_current(context);
++            result.set_value(current);
++            if (!current)
++                return;
++            for (;;) {
++                std::packaged_task<OGLShaderStage()> compile;
++                {
++                    std::unique_lock lock(mutex);
++                    wake.wait(lock, [&] { return stopping || !queue.empty(); });
++                    if (stopping)
++                        break;
++                    compile = std::move(queue.front());
++                    queue.pop_front();
++                }
++                compile();
++            }
++            callbacks.clear_current(context);
++        });
++        return ready.get();
++    }
++
++    std::future<OGLShaderStage> Queue(std::string source, bool separable) {
++        const bool first = !submitted_shader;
++        submitted_shader = true;
++        std::packaged_task<OGLShaderStage()> compile([code = std::move(source), separable, first] {
++            OGLShaderStage stage(separable);
++            stage.Create(code.c_str(), GL_FRAGMENT_SHADER);
++            // Only the compilation thread waits here. Publish a usable shared GL object.
++            glFinish();
++            if (first)
++                LOG_INFO(Render_OpenGL, "First fragment shader compiled on the background thread");
++            return stage;
++        });
++        auto result = compile.get_future();
++        {
++            std::lock_guard lock(mutex);
++            queue.push_back(std::move(compile));
++        }
++        wake.notify_one();
++        return result;
++    }
++
++    ~FragmentCompiler() {
++        {
++            std::lock_guard lock(mutex);
++            stopping = true;
++            queue.clear();
++        }
++        wake.notify_one();
++        if (thread.joinable())
++            thread.join();
++        if (context)
++            callbacks.destroy(context);
++    }
++
++private:
++    FragmentCompilerContext callbacks;
++    void* context{};
++    std::mutex mutex;
++    std::condition_variable wake;
++    std::deque<std::packaged_task<OGLShaderStage()>> queue;
++    bool stopping{};
++    bool submitted_shader{};
++    std::thread thread;
++};
++
+ class TrivialVertexShader {
+ public:
+     explicit TrivialVertexShader(const Driver& driver, bool separable) : program(separable) {
+@@ -171,6 +265,40 @@ public:
+         return {iter->first, cached_shader.GetHandle(), std::move(result)};
+     }
+ 
++    template <typename... Args>
++    std::tuple<u64, GLuint, std::optional<std::string>> GetAsync(
++        FragmentCompiler& compiler, const KeyConfigType& config, Args&&... args) {
++        static_assert(ShaderType == GL_FRAGMENT_SHADER);
++        const u64 hash = config.Hash();
++        if (auto cached = shaders.find(hash); cached != shaders.end())
++            return {hash, cached->second.GetHandle(), std::nullopt};
++
++        if (auto job = pending.find(hash); job != pending.end()) {
++            if (job->second.wait_for(std::chrono::seconds(0)) != std::future_status::ready)
++                return {hash, 0, std::nullopt};
++            auto result = job->second.get();
++            pending.erase(job);
++            auto cached = shaders.emplace(hash, std::move(result)).first;
++            return {hash, cached->second.GetHandle(), std::nullopt};
++        }
++        // Bound queued shader work during loading or when many draws are novel.
++        if (pending.size() >= 64) {
++            for (auto it = pending.begin(); it != pending.end();) {
++                if (it->second.wait_for(std::chrono::seconds(0)) == std::future_status::ready) {
++                    shaders.emplace(it->first, it->second.get());
++                    it = pending.erase(it);
++                } else {
++                    ++it;
++                }
++            }
++            if (pending.size() >= 64)
++                return {hash, 0, std::nullopt};
++        }
++        auto source = CodeGenerator(config, args...);
++        pending.emplace(hash, compiler.Queue(source, separable));
++        return {hash, 0, std::move(source)};
++    }
++
+     void Inject(const KeyConfigType& key, OGLProgram&& program) {
+         OGLShaderStage stage{separable};
+         stage.Inject(std::move(program));
+@@ -184,6 +312,7 @@ public:
+ private:
+     bool separable;
+     std::unordered_map<u64, OGLShaderStage> shaders;
++    std::unordered_map<u64, std::future<OGLShaderStage>> pending;
+ };
+ 
+ // This is a cache designed for shaders translated from PICA shaders. The first cache matches the
+@@ -287,6 +416,16 @@ public:
+             .has_gl_nv_fragment_shader_barycentric = false,
+             .is_vulkan = false,
+         };
++        if (Settings::values.async_shader_compilation.GetValue() &&
++            fragment_compiler_context.create) {
++            auto compiler = std::make_unique<FragmentCompiler>(fragment_compiler_context);
++            if (compiler->Start()) {
++                fragment_compiler = std::move(compiler);
++                LOG_INFO(Render_OpenGL, "Asynchronous fragment shader compilation is enabled");
++            } else {
++                LOG_WARNING(Render_OpenGL, "Could not create the shader worker; compiling synchronously");
++            }
++        }
+     }
+ 
+     struct ShaderTuple {
+@@ -328,6 +467,7 @@ public:
+     std::unordered_map<u64, OGLProgram> program_cache;
+     OGLPipeline pipeline;
+     ShaderDiskCache disk_cache;
++    std::unique_ptr<FragmentCompiler> fragment_compiler;
+ 
+     Pica::Shader::Generator::ExtraVSConfig CalcExtraConfig(
+         const Pica::Shader::Generator::PicaVSConfig& config, bool accurate_mul) {
+@@ -406,10 +546,12 @@ void ShaderProgramManager::UseTrivialGeometryShader() {
+     impl->current.gs_hash = 0;
+ }
+ 
+-void ShaderProgramManager::UseFragmentShader(const Pica::RegsInternal& regs,
++bool ShaderProgramManager::UseFragmentShader(const Pica::RegsInternal& regs,
+                                              const Pica::Shader::UserConfig& user) {
+     const FSConfig fs_config{regs};
+-    auto [hash, handle, result] = impl->fragment_shaders.Get(fs_config, user, impl->profile);
++    auto [hash, handle, result] = impl->fragment_compiler
++        ? impl->fragment_shaders.GetAsync(*impl->fragment_compiler, fs_config, user, impl->profile)
++        : impl->fragment_shaders.Get(fs_config, user, impl->profile);
+     impl->current.fs = handle;
+     impl->current.fs_hash = hash;
+     // Save FS to the disk cache if its a new shader
+@@ -420,6 +562,7 @@ void ShaderProgramManager::UseFragmentShader(const Pica::RegsInternal& regs,
+         disk_cache.SaveRaw(raw);
+         disk_cache.SaveDecompiled(unique_identifier, *result, false);
+     }
++    return handle != 0;
+ }
+ 
+ void ShaderProgramManager::ApplyTo(OpenGLState& state, bool accurate_mul) {
+diff --git a/src/video_core/renderer_opengl/gl_shader_manager.h b/src/video_core/renderer_opengl/gl_shader_manager.h
+index 57aff7c..31db1b8 100644
+--- a/src/video_core/renderer_opengl/gl_shader_manager.h
++++ b/src/video_core/renderer_opengl/gl_shader_manager.h
+@@ -22,6 +22,9 @@ union UserConfig;
+ 
+ namespace OpenGL {
+ 
++void SetMultisplitCompilerContext(void* (*create)(), bool (*make_current)(void*),
++                                  void (*clear_current)(void*), void (*destroy)(void*));
++
+ class Driver;
+ class OpenGLState;
+ 
+@@ -50,7 +53,7 @@ public:
+ 
+     void UseTrivialGeometryShader();
+ 
+-    void UseFragmentShader(const Pica::RegsInternal& config, const Pica::Shader::UserConfig& user);
++    bool UseFragmentShader(const Pica::RegsInternal& config, const Pica::Shader::UserConfig& user);
+ 
+     void ApplyTo(OpenGLState& state, bool accurate_mul);
+ 

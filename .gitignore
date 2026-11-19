@@ -1,0 +1,5 @@
+/build/
+/azahar/
+*.dll
+*.so
+*.zip
