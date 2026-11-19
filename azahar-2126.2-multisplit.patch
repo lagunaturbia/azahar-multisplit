@@ -18,7 +18,7 @@ index e28f994..2c97da5 100644
  
  add_custom_target(azahar_libretro DEPENDS citra_libretro)
 diff --git a/src/citra_libretro/citra_libretro.cpp b/src/citra_libretro/citra_libretro.cpp
-index 8a65f9d..9b03721 100644
+index 8a65f9d..eceea37 100644
 --- a/src/citra_libretro/citra_libretro.cpp
 +++ b/src/citra_libretro/citra_libretro.cpp
 @@ -2,7 +2,9 @@
@@ -155,8 +155,9 @@ index 8a65f9d..9b03721 100644
 +         pad_touch ? "Touch Screen Touch" : "ZR"},
          {0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_START, "Start"},
          {0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_SELECT, "Select"},
-         {0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_L3, "Home/Swap screens"},
+-        {0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_L3, "Home/Swap screens"},
 -        {0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_R3, "Touch Screen Touch"},
++        {0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_L3, "Home"},
          {0, RETRO_DEVICE_ANALOG, RETRO_DEVICE_INDEX_ANALOG_LEFT, RETRO_DEVICE_ID_ANALOG_X,
           "Circle Pad X"},
          {0, RETRO_DEVICE_ANALOG, RETRO_DEVICE_INDEX_ANALOG_LEFT, RETRO_DEVICE_ID_ANALOG_Y,
@@ -180,7 +181,47 @@ index 8a65f9d..9b03721 100644
      // Citra: HOME = RETRO_DEVICE_ID_JOYPAD_L3 (as per above bindings) (14)
      Settings::values.current_input_profile.buttons[Settings::NativeButton::Values::Home] =
          "button:14,joystick:0,engine:libretro";
-@@ -369,8 +444,12 @@ static void setup_memory_maps() {
+@@ -236,39 +311,6 @@ void retro_run() {
+         mic_input->PollMicrophone();
+     }
+ 
+-    // Check if the screen swap button is pressed
+-    static bool screen_swap_button_state = false;
+-    static bool screens_swapped = false;
+-    bool screen_swap_btn =
+-        !!LibRetro::CheckInput(0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_L3);
+-    if (screen_swap_btn != screen_swap_button_state) {
+-        if (LibRetro::settings.swap_screen_mode == "Toggle") {
+-            if (!screen_swap_button_state)
+-                screens_swapped = !screens_swapped;
+-
+-            if (screens_swapped)
+-                Settings::values.swap_screen =
+-                    LibRetro::FetchVariable("citra_swap_screen", "Top") != "Bottom";
+-            else
+-                Settings::values.swap_screen =
+-                    LibRetro::FetchVariable("citra_swap_screen", "Top") == "Bottom";
+-        } else {
+-            if (screen_swap_btn)
+-                Settings::values.swap_screen =
+-                    LibRetro::FetchVariable("citra_swap_screen", "Top") != "Bottom";
+-            else
+-                Settings::values.swap_screen =
+-                    LibRetro::FetchVariable("citra_swap_screen", "Top") == "Bottom";
+-        }
+-
+-        Core::System::GetInstance().ApplySettings();
+-
+-        // Update the framebuffer sizing.
+-        emu_instance->emu_window->UpdateLayout();
+-
+-        screen_swap_button_state = screen_swap_btn;
+-    }
+-
+ #ifdef ENABLE_OPENGL
+     if (Settings::values.graphics_api.GetValue() == Settings::GraphicsAPI::OpenGL) {
+         // We can't assume that the frontend has been nice and preserved all OpenGL settings. Reset.
+@@ -369,8 +411,12 @@ static void setup_memory_maps() {
  }
  
  static bool do_load_game() {
@@ -194,7 +235,7 @@ index 8a65f9d..9b03721 100644
  
      switch (load_result) {
      case Core::System::ResultStatus::Success:
-@@ -404,6 +483,9 @@ static bool do_load_game() {
+@@ -404,6 +450,9 @@ static bool do_load_game() {
          return false;
      }
  
@@ -204,7 +245,7 @@ index 8a65f9d..9b03721 100644
      u64 program_id{};
      Core::System::GetInstance().GetAppLoader().ReadProgramId(program_id);
      Core::System::GetInstance().GPU().ApplyPerProgramSettings(program_id);
-@@ -473,18 +555,15 @@ static void context_reset() {
+@@ -473,18 +522,15 @@ static void context_reset() {
      if (!emu_instance->game_loaded) {
          emu_instance->game_loaded = do_load_game();
      } else {
@@ -226,7 +267,7 @@ index 8a65f9d..9b03721 100644
          Core::System::GetInstance().GPU().ReleaseRenderer();
      }
      emu_instance->emu_window->DestroyContext();
-@@ -634,6 +713,7 @@ bool retro_load_game(const struct retro_game_info* info) {
+@@ -634,6 +680,7 @@ bool retro_load_game(const struct retro_game_info* info) {
  
  void retro_unload_game() {
      LOG_DEBUG(Frontend, "Unloading game...");

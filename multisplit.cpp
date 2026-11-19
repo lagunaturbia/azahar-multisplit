@@ -69,8 +69,6 @@ struct Instance {
     bool initialized{};
     bool game_loaded{};
     bool context_live{};
-    bool swap_pressed{};
-    bool swapped{};
     retro_hw_render_callback* hw{};
     bool has_gpu_frame{};
 };
@@ -120,8 +118,6 @@ bool loaded{};
 enum class Renderer { Software, OpenGL, Vulkan };
 Renderer renderer = Renderer::Software;
 bool hardware() { return renderer != Renderer::Software; }
-bool hold_swap{};
-bool start_swapped{};
 bool mouse_touch{};
 bool direct_touch{};
 bool context_failed{};
@@ -161,8 +157,6 @@ constexpr CoreOption core_options[] = {
     {"citra_audio_emulation", "Audio Emulation (Restart); hle|lle|lle_multithread", "hle"},
     {"citra_analog_function", "Right Analog Function (Restart); c_stick_and_touchscreen|touchscreen_pointer|c_stick", "c_stick_and_touchscreen"},
     {"citra_analog_deadzone", "Analog Deadzone (Restart); 15|0|5|10|20|25|30|35", "15"},
-    {"citra_swap_screen", "Initial Screen (Restart); Top|Bottom", "Top"},
-    {"citra_swap_screen_mode", "Screen Swap Mode (Restart); Toggle|Hold", "Toggle"},
     {"citra_enable_mouse_touchscreen", "Mouse Touchscreen Support (Restart); enabled|disabled", "enabled"},
     {"citra_enable_touch_touchscreen", "Touch Device Support (Restart); enabled|disabled", "enabled"},
     {"citra_enable_touch_pointer_timeout", "Touch Pointer Timeout (Restart); enabled|disabled", "enabled"},
@@ -305,6 +299,7 @@ const char* fixed_variable(const char* key) {
 
     static constexpr std::pair<const char*, const char*> options[] = {
         {"citra_layout_option", "default"},
+        {"citra_swap_screen", "Top"},
         {"citra_use_libretro_save_path", "LibRetro Default"},
     };
     for (const auto& [name, value] : options) {
@@ -638,8 +633,7 @@ void poll_pointer() {
                                          active_players - 1);
         const int local_x = column_x - static_cast<int>(2 * player + 1) * range;
         const int touch_x_limit = range * equal_width / tile_width();
-        const bool touches_screen = local_x >= -touch_x_limit && local_x < touch_x_limit &&
-                                    (instances[player].swapped ? y < 0 : y >= 0);
+        const bool touches_screen = local_x >= -touch_x_limit && local_x < touch_x_limit && y >= 0;
 
         if (touches_screen) {
             hit = static_cast<int>(player);
@@ -656,19 +650,6 @@ void poll_pointer() {
         pointers[hit].mouse_pressed = mouse_down;
     }
     was_mouse_down = down;
-}
-
-void poll_screen_swaps() {
-    for (unsigned p = 0; p < active_players; ++p) {
-        auto& instance = instances[p];
-        const bool pressed = frontend_input && controller_devices[p] != RETRO_DEVICE_NONE &&
-                             frontend_input(p, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_L3);
-        if (hold_swap)
-            instance.swapped = start_swapped != pressed;
-        else if (pressed && !instance.swap_pressed)
-            instance.swapped = !instance.swapped;
-        instance.swap_pressed = pressed;
-    }
 }
 
 template <unsigned Player>
@@ -725,7 +706,6 @@ void start_instance(const retro_game_info& game) {
     const auto save_path = save_root / player;
     fs::create_directories(save_path);
     instance.save_dir = save_path.generic_u8string();
-    instance.swapped = start_swapped;
     if (!hardware())
         instance.software_frame.resize(tile_width() * player_height);
     const auto copy = instance_module_path(Player);
@@ -974,8 +954,6 @@ bool retro_load_game(const retro_game_info* game) {
         if (!frontend_environment(RETRO_ENVIRONMENT_SET_PIXEL_FORMAT, &format))
             throw std::runtime_error("Frontend does not support XRGB8888.");
 
-        hold_swap = std::strcmp(fixed_variable("citra_swap_screen_mode"), "Hold") == 0;
-        start_swapped = std::strcmp(fixed_variable("citra_swap_screen"), "Bottom") == 0;
         mouse_touch = std::strcmp(fixed_variable("citra_enable_mouse_touchscreen"), "enabled") == 0;
         direct_touch = std::strcmp(fixed_variable("citra_enable_touch_touchscreen"), "enabled") == 0;
         renderer = preferred_renderer();
@@ -1041,7 +1019,6 @@ void retro_run() {
         }
         if (menu_buttons_to_release)
             menu_buttons_to_release &= player_one_buttons();
-        poll_screen_swaps();
         poll_pointer();
 
         const auto output = geometry();

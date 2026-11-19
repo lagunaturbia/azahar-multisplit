@@ -19,7 +19,7 @@ If you already installed the RetroBat integration, you can also update it by ext
 2. Load a game with Azahar Multisplit. On **Select Players**, use the first controller’s D-pad to choose 2, 3 or 4 consoles and press **A** or **Start**.
 3. Open the in-game local multiplayer menu on each console. In Mario Kart 7, create a group on P1 and select it from the other consoles.
 
-Each controller is assigned to one column, in order from left to right. Audio comes from P1. **L3** swaps the screens for that console. Move the **right stick** to show the touchscreen cursor and use **R2** to tap or hold and drag. The cursor hides after four idle seconds by default. The mouse also works on the corresponding touchscreen.
+Each controller is assigned to one column, in order from left to right. Audio comes from P1. The upper screen and touchscreen keep their positions. Move the **right stick** to show the touchscreen cursor and use **R2** to tap or hold and drag. The cursor hides after four idle seconds by default. The mouse also works on the corresponding touchscreen.
 
 With cursor control enabled, **R3** is mapped to the 3DS ZR button. In **Right Analog Function**, choose `touchscreen_pointer` to dedicate the stick to the cursor or `c_stick` to use the right stick as the 3DS C-Stick with ZR on R2. Reopen the game after changing this option.
 

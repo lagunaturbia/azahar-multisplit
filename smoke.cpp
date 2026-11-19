@@ -334,7 +334,7 @@ int main(int argc, char** argv) {
         frames = polls = audio_batches = 0;
         queries = {};
         unsigned both_visible = 0;
-        bool swap_observed = false;
+        bool layout_changed = false;
         std::array<unsigned, 2> colors_before{};
         in_selector = false;
         for (unsigned i = 0; i < 150; ++i) {
@@ -344,14 +344,14 @@ int main(int argc, char** argv) {
                 ++both_visible;
             if (i == 99)
                 colors_before = color_pixels;
-            if (i >= 103 && top_color_pixels[0] < top_color_pixels[1] / 2 &&
+            if (i >= 100 && top_color_pixels[0] < top_color_pixels[1] / 2 &&
                 color_pixels[0] > 100 && hashes[0] != hashes[1])
-                swap_observed = true;
+                layout_changed = true;
         }
         std::printf("round=%u fps=%.4f rate=%.0f frames=%u polls=%u input=%u,%u "
-                    "audio_batches=%u both_visible=%u swap=%d colors_before=%u,%u colors_after=%u,%u top_after=%u,%u\n",
+                    "audio_batches=%u both_visible=%u layout_changed=%d colors_before=%u,%u colors_after=%u,%u top_after=%u,%u\n",
                     round + 1, av.timing.fps, av.timing.sample_rate, frames, polls, queries[0],
-                    queries[1], audio_batches, both_visible, swap_observed, colors_before[0],
+                    queries[1], audio_batches, both_visible, layout_changed, colors_before[0],
                     colors_before[1], color_pixels[0], color_pixels[1], top_color_pixels[0],
                     top_color_pixels[1]);
         std::fflush(stdout);
@@ -359,7 +359,7 @@ int main(int argc, char** argv) {
             hw->context_destroy();
         WRAP(unload_game)();
         if (frames != 150 || polls != 150 || !queries[0] || !queries[1] ||
-            both_visible < 15 || (!expect_compiled_shader && !swap_observed) ||
+            both_visible < 15 || (!expect_compiled_shader && layout_changed) ||
             joined_rooms < round + 1 ||
             (use_gl && !disable_async_shaders && shader_workers < (round + 1) * 2)) {
             WRAP(deinit)();
